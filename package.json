@@ -1,0 +1,21 @@
+{
+  "name": "culture-backend",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "culture": "node ./bin/www",
+    "dev":"node ./routes/index"
+  },
+  "dependencies": {
+    "cookie-parser": "~1.4.4",
+    "cors": "^2.8.6",
+    "debug": "~2.6.9",
+    "dotenv": "^17.4.2",
+    "express": "~4.16.1",
+    "http-errors": "~1.6.3",
+    "jade": "~1.11.0",
+    "morgan": "~1.9.1",
+    "mysql2": "^3.22.3",
+    "nodemailer": "^8.0.7"
+  }
+}
