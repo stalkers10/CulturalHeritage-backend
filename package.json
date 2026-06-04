@@ -3,8 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "culture": "node ./bin/www",
-    "dev":"node ./routes/index"
+    "start": "node ./bin/www",
+    "dev": "node ./bin/www",
+     "seed:home": "node scripts/seed-home-page.js"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
@@ -16,6 +17,8 @@
     "jade": "~1.11.0",
     "morgan": "~1.9.1",
     "mysql2": "^3.22.3",
-    "nodemailer": "^8.0.7"
+    "nodemailer": "^8.0.7",
+    "pg": "^8.21.0",
+    "postgres": "^3.4.9"
   }
 }

@@ -31,6 +31,8 @@ Thumbs.db
 # Build output
 dist/
 build/
+public/uploads/
+data/contribution-media.json
 
 # Testing
 coverage/
