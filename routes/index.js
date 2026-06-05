@@ -13,7 +13,6 @@ const PASSWORD_ITERATIONS = 310000;
 const PASSWORD_KEY_LENGTH = 32;
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'heritage-dev-session-secret';
 const uploadDir = path.join(__dirname, '..', 'public', 'uploads');
-const mediaStorePath = path.join(__dirname, '..', 'data', 'contribution-media.json');
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -74,6 +73,7 @@ function createAuthToken(user) {
     sub: String(user.id),
     email: user.email,
     name: user.fullName,
+    role: user.role || 'user',
     exp: Date.now() + SESSION_TTL_MS
   };
   const payloadText = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -136,27 +136,148 @@ function buildAuthResponse(user) {
     user: {
       id: String(user.id),
       email: user.email,
-      name: user.fullName
+      name: user.fullName,
+      role: user.role || 'user',
+      avatarUrl: user.avatar_url || null
     }
   };
 }
 
-async function readMediaStore() {
-  try {
-    const contents = await fs.readFile(mediaStorePath, 'utf8');
-    return JSON.parse(contents);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return {};
-    }
+function requireAdmin(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  const authUser = match ? verifyAuthToken(match[1]) : null;
 
-    throw error;
+  if (!authUser) {
+    return res.status(401).json({ status: 'error', message: 'Please login before continuing' });
   }
+
+  if (authUser.role !== 'admin') {
+    return res.status(403).json({ status: 'error', message: 'Admin access required' });
+  }
+
+  req.authUser = authUser;
+  next();
 }
 
-async function writeMediaStore(store) {
-  await fs.mkdir(path.dirname(mediaStorePath), { recursive: true });
-  await fs.writeFile(mediaStorePath, JSON.stringify(store, null, 2));
+let userProfileColumnsPromise = null;
+
+async function ensureUserProfileColumns() {
+  if (!userProfileColumnsPromise) {
+    userProfileColumnsPromise = (async () => {
+      const columns = [
+        ['avatar_url', 'VARCHAR(500) NULL'],
+        ['phone', 'VARCHAR(50) NULL'],
+        ['location', 'VARCHAR(120) NULL'],
+        ['bio', 'TEXT NULL']
+      ];
+
+      for (const [columnName, definition] of columns) {
+        const [rows] = await db.execute(`SHOW COLUMNS FROM users LIKE '${columnName}'`);
+
+        if (rows.length === 0) {
+          try {
+            await db.execute(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`);
+          } catch (error) {
+            if (error.code !== 'ER_DUP_FIELDNAME') {
+              throw error;
+            }
+          }
+        }
+      }
+    })().catch((error) => {
+      userProfileColumnsPromise = null;
+      throw error;
+    });
+  }
+
+  return userProfileColumnsPromise;
+}
+
+let eventsModerationColumnsPromise = null;
+
+async function ensureEventsModerationColumns() {
+  if (!eventsModerationColumnsPromise) {
+    eventsModerationColumnsPromise = (async () => {
+      const [statusColumns] = await db.execute("SHOW COLUMNS FROM events LIKE 'status'");
+
+      if (statusColumns.length === 0) {
+        try {
+          await db.execute("ALTER TABLE events ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'Approved' AFTER is_active");
+        } catch (error) {
+          if (error.code !== 'ER_DUP_FIELDNAME') {
+            throw error;
+          }
+        }
+      }
+    })().catch((error) => {
+      eventsModerationColumnsPromise = null;
+      throw error;
+    });
+  }
+
+  return eventsModerationColumnsPromise;
+}
+
+function mapUserProfile(user, stats = {}) {
+  return {
+    id: String(user.id),
+    email: user.email,
+    name: user.fullName,
+    avatarUrl: user.avatar_url || null,
+    phone: user.phone || '',
+    location: user.location || '',
+    bio: user.bio || '',
+    stats: {
+      contributionCount: Number(stats.contributionCount || 0),
+      approvedContributionCount: Number(stats.approvedContributionCount || 0),
+      reminderCount: Number(stats.reminderCount || 0),
+      upcomingReminderCount: Number(stats.upcomingReminderCount || 0)
+    }
+  };
+}
+
+async function getProfileStats(userId) {
+  const stats = {
+    contributionCount: 0,
+    approvedContributionCount: 0,
+    reminderCount: 0,
+    upcomingReminderCount: 0
+  };
+
+  try {
+    const [contributionRows] = await db.execute(
+      `SELECT COUNT(*) AS contributionCount,
+              SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) AS approvedContributionCount
+       FROM contributions`
+    );
+
+    stats.contributionCount = contributionRows[0]?.contributionCount || 0;
+    stats.approvedContributionCount = contributionRows[0]?.approvedContributionCount || 0;
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  try {
+    const [reminderRows] = await db.execute(
+      `SELECT COUNT(*) AS reminderCount,
+              SUM(CASE WHEN remind_at > NOW() THEN 1 ELSE 0 END) AS upcomingReminderCount
+       FROM event_reminders
+       WHERE user_id = ?`,
+      [userId]
+    );
+
+    stats.reminderCount = reminderRows[0]?.reminderCount || 0;
+    stats.upcomingReminderCount = reminderRows[0]?.upcomingReminderCount || 0;
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  return stats;
 }
 
 function sanitizeFileName(fileName) {
@@ -224,15 +345,6 @@ async function saveContributionMedia({ mediaData, mediaName, mediaMimeType, medi
   };
 }
 
-async function attachContributionMedia(rows) {
-  const mediaStore = await readMediaStore();
-
-  return rows.map((row) => ({
-    ...row,
-    ...(mediaStore[String(row.id)] || {})
-  }));
-}
-
 function mapHomeItem(row) {
   return {
     id: Number(row.id),
@@ -250,10 +362,72 @@ function mapHomeItem(row) {
   };
 }
 
+function mapExploreItem(row) {
+  return {
+    id: Number(row.id),
+    sectionKey: row.section_key,
+    eyebrow: row.eyebrow,
+    title: row.title,
+    subtitle: row.subtitle,
+    description: row.description,
+    meta: row.meta,
+    imageUrl: row.image_url,
+    icon: row.icon,
+    actionLabel: row.action_label,
+    actionRoute: row.action_route,
+    sortOrder: Number(row.sort_order)
+  };
+}
+
+function mapEvent(row) {
+  return {
+    id: Number(row.id),
+    title: row.title,
+    category: row.category,
+    region: row.region,
+    city: row.city,
+    venue: row.venue,
+    description: row.description,
+    eventDate: row.event_date,
+    endDate: row.end_date,
+    imageUrl: row.image_url,
+    organizer: row.organizer,
+    priceLabel: row.price_label,
+    mapUrl: row.map_url,
+    isFeatured: Boolean(row.is_featured)
+  };
+}
+
+function mapEventReminder(row) {
+  return {
+    id: Number(row.id),
+    eventId: Number(row.event_id),
+    remindAt: row.remind_at,
+    reminderOffsetMinutes: Number(row.reminder_offset_minutes),
+    notificationId: Number(row.notification_id),
+    eventTitle: row.event_title,
+    eventDate: row.event_date
+  };
+}
+
 function getHomeMissingTablesResponse(res) {
   return res.status(500).json({
     status: 'error',
     message: 'Home page database tables are missing. Run npm run seed:home in the backend folder.'
+  });
+}
+
+function getExploreMissingTablesResponse(res) {
+  return res.status(500).json({
+    status: 'error',
+    message: 'Explore page database tables are missing. Run npm run seed:explore in the backend folder.'
+  });
+}
+
+function getEventsMissingTablesResponse(res) {
+  return res.status(500).json({
+    status: 'error',
+    message: 'Events database tables are missing. Run npm run seed:events in the backend folder.'
   });
 }
 
@@ -332,6 +506,346 @@ router.get('/api/home', async function(req, res, next) {
     }
 
     res.status(500).json({ status: 'error', message: 'Failed to fetch home page content' });
+  }
+});
+
+/* GET database-backed explore page content. */
+router.get('/api/explore', async function(req, res, next) {
+  try {
+    const [settingRows] = await db.execute(
+      'SELECT setting_key, setting_value FROM explore_settings ORDER BY setting_key'
+    );
+    const [sectionRows] = await db.execute(
+      `SELECT section_key, eyebrow, title, subtitle, action_label, action_route, layout, sort_order
+       FROM explore_sections
+       WHERE is_active = 1
+       ORDER BY sort_order ASC, id ASC`
+    );
+    const [itemRows] = await db.execute(
+      `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
+              action_label, action_route, sort_order
+       FROM explore_items
+       WHERE is_active = 1
+       ORDER BY section_key ASC, sort_order ASC, id ASC`
+    );
+
+    const settings = settingRows.reduce((result, row) => {
+      result[row.setting_key] = row.setting_value;
+      return result;
+    }, {});
+
+    const itemsBySection = itemRows.reduce((result, row) => {
+      const sectionItems = result.get(row.section_key) || [];
+      sectionItems.push(mapExploreItem(row));
+      result.set(row.section_key, sectionItems);
+      return result;
+    }, new Map());
+
+    const sections = sectionRows.map((row) => ({
+      key: row.section_key,
+      eyebrow: row.eyebrow,
+      title: row.title,
+      subtitle: row.subtitle,
+      actionLabel: row.action_label,
+      actionRoute: row.action_route,
+      layout: row.layout,
+      sortOrder: Number(row.sort_order),
+      items: itemsBySection.get(row.section_key) || []
+    }));
+
+    res.json({
+      status: 'success',
+      settings,
+      sections
+    });
+  } catch (error) {
+    console.error('Explore page database error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getExploreMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to fetch explore page content' });
+  }
+});
+
+/* GET database-backed cultural events. */
+router.get('/api/events', async function(req, res, next) {
+  try {
+    await ensureEventsModerationColumns();
+
+    const [rows] = await db.execute(
+      `SELECT id, title, category, region, city, venue, description, event_date, end_date,
+              image_url, organizer, price_label, map_url, is_featured
+       FROM events
+       WHERE is_active = 1 AND status = 'Approved'
+       ORDER BY event_date ASC, id ASC`
+    );
+
+    res.json({
+      status: 'success',
+      events: rows.map(mapEvent)
+    });
+  } catch (error) {
+    console.error('Events database error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getEventsMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to fetch events' });
+  }
+});
+
+/* POST cultural event submission. Admin submissions publish immediately. */
+router.post('/api/events', requireAuth, async function(req, res, next) {
+  const title = String(req.body.title ?? '').trim();
+  const category = String(req.body.category ?? '').trim();
+  const region = String(req.body.region ?? '').trim();
+  const city = String(req.body.city ?? '').trim();
+  const venue = String(req.body.venue ?? '').trim();
+  const description = String(req.body.description ?? '').trim();
+  const eventDate = new Date(String(req.body.eventDate || ''));
+  const endDateValue = String(req.body.endDate || '').trim();
+  const endDate = endDateValue ? new Date(endDateValue) : null;
+  const imageUrl = String(req.body.imageUrl ?? '').trim() || null;
+  const organizer = String(req.body.organizer ?? '').trim() || null;
+  const priceLabel = String(req.body.priceLabel ?? '').trim() || null;
+  const mapUrl = String(req.body.mapUrl ?? '').trim() || null;
+  const reviewStatus = req.authUser.role === 'admin' ? 'Approved' : 'Pending';
+  const isActive = reviewStatus === 'Approved' ? 1 : 0;
+
+  if (!title || !category || !region || !city || !venue || !description) {
+    return res.status(400).json({ status: 'error', message: 'Title, category, location, venue, and description are required' });
+  }
+
+  if (Number.isNaN(eventDate.getTime()) || eventDate.getTime() <= Date.now()) {
+    return res.status(400).json({ status: 'error', message: 'Event date must be a valid future date' });
+  }
+
+  if (endDate && (Number.isNaN(endDate.getTime()) || endDate.getTime() <= eventDate.getTime())) {
+    return res.status(400).json({ status: 'error', message: 'End date must be after the event start date' });
+  }
+
+  if (
+    title.length > 255 ||
+    category.length > 100 ||
+    region.length > 100 ||
+    city.length > 100 ||
+    venue.length > 255 ||
+    description.length > 1200 ||
+    (imageUrl && imageUrl.length > 500) ||
+    (organizer && organizer.length > 255) ||
+    (priceLabel && priceLabel.length > 100) ||
+    (mapUrl && mapUrl.length > 500)
+  ) {
+    return res.status(400).json({ status: 'error', message: 'Event details are too long' });
+  }
+
+  try {
+    await ensureEventsModerationColumns();
+
+    const [result] = await db.execute(
+      `INSERT INTO events
+         (title, category, region, city, venue, description, event_date, end_date,
+          image_url, organizer, price_label, map_url, is_featured, is_active, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [
+        title,
+        category,
+        region,
+        city,
+        venue,
+        description,
+        eventDate,
+        endDate,
+        imageUrl,
+        organizer,
+        priceLabel,
+        mapUrl,
+        isActive,
+        reviewStatus
+      ]
+    );
+
+    let event = null;
+
+    if (reviewStatus === 'Approved') {
+      const [rows] = await db.execute(
+        `SELECT id, title, category, region, city, venue, description, event_date, end_date,
+                image_url, organizer, price_label, map_url, is_featured
+         FROM events
+         WHERE id = ?
+         LIMIT 1`,
+        [result.insertId]
+      );
+      event = rows[0] ? mapEvent(rows[0]) : null;
+    }
+
+    res.json({
+      status: 'success',
+      message: reviewStatus === 'Approved'
+        ? 'Event published successfully'
+        : 'Event submitted for admin approval',
+      eventId: result.insertId,
+      reviewStatus,
+      event
+    });
+  } catch (error) {
+    console.error('Submit event error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getEventsMissingTablesResponse(res);
+    }
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ status: 'error', message: 'An event with this title already exists' });
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to submit event' });
+  }
+});
+
+/* GET reminders for the logged-in user. */
+router.get('/api/event-reminders', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT er.id, er.event_id, er.remind_at, er.reminder_offset_minutes, er.notification_id,
+              e.title AS event_title, e.event_date
+       FROM event_reminders er
+       INNER JOIN events e ON e.id = er.event_id
+       WHERE er.user_id = ?
+       ORDER BY er.remind_at ASC, er.id ASC`,
+      [userId]
+    );
+
+    res.json({
+      status: 'success',
+      reminders: rows.map(mapEventReminder)
+    });
+  } catch (error) {
+    console.error('Event reminders database error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getEventsMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to fetch reminders' });
+  }
+});
+
+/* POST/replace a reminder for one event. */
+router.post('/api/event-reminders', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+  const eventId = Number(req.body.eventId);
+  const remindAt = new Date(String(req.body.remindAt || ''));
+  const reminderOffsetMinutes = Number(req.body.reminderOffsetMinutes);
+  const notificationId = Number(req.body.notificationId);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!Number.isInteger(eventId) || eventId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Valid event is required' });
+  }
+
+  if (Number.isNaN(remindAt.getTime()) || remindAt.getTime() <= Date.now()) {
+    return res.status(400).json({ status: 'error', message: 'Reminder time must be in the future' });
+  }
+
+  if (!Number.isInteger(reminderOffsetMinutes) || reminderOffsetMinutes < 0) {
+    return res.status(400).json({ status: 'error', message: 'Valid reminder offset is required' });
+  }
+
+  if (!Number.isInteger(notificationId) || notificationId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Valid notification id is required' });
+  }
+
+  try {
+    const [eventRows] = await db.execute(
+      'SELECT id, title, event_date FROM events WHERE id = ? AND is_active = 1 LIMIT 1',
+      [eventId]
+    );
+
+    if (eventRows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Event not found' });
+    }
+
+    await db.execute(
+      `INSERT INTO event_reminders (user_id, event_id, remind_at, reminder_offset_minutes, notification_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         remind_at = VALUES(remind_at),
+         reminder_offset_minutes = VALUES(reminder_offset_minutes),
+         notification_id = VALUES(notification_id)`,
+      [userId, eventId, remindAt, reminderOffsetMinutes, notificationId]
+    );
+
+    const [reminderRows] = await db.execute(
+      `SELECT er.id, er.event_id, er.remind_at, er.reminder_offset_minutes, er.notification_id,
+              e.title AS event_title, e.event_date
+       FROM event_reminders er
+       INNER JOIN events e ON e.id = er.event_id
+       WHERE er.user_id = ? AND er.event_id = ?
+       LIMIT 1`,
+      [userId, eventId]
+    );
+
+    res.json({
+      status: 'success',
+      message: 'Reminder saved',
+      reminder: mapEventReminder(reminderRows[0])
+    });
+  } catch (error) {
+    console.error('Save event reminder error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getEventsMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to save reminder' });
+  }
+});
+
+/* DELETE a reminder for the logged-in user. */
+router.delete('/api/event-reminders/:id', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+  const reminderId = Number(req.params.id);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!Number.isInteger(reminderId) || reminderId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Valid reminder is required' });
+  }
+
+  try {
+    const [result] = await db.execute(
+      'DELETE FROM event_reminders WHERE id = ? AND user_id = ?',
+      [reminderId, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: 'error', message: 'Reminder not found' });
+    }
+
+    res.json({ status: 'success', message: 'Reminder removed' });
+  } catch (error) {
+    console.error('Delete event reminder error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getEventsMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to remove reminder' });
   }
 });
 
@@ -442,7 +956,7 @@ router.post('/api/verify-otp', async function(req, res, next) {
       await db.execute('DELETE FROM otps WHERE user_id = ?', [userId]);
       
       // Get user details
-      const [userRows] = await db.execute('SELECT id, email, fullName FROM users WHERE id = ?', [userId]);
+      const [userRows] = await db.execute('SELECT id, email, fullName, role, avatar_url FROM users WHERE id = ?', [userId]);
       const user = userRows[0];
 
       res.json({
@@ -467,6 +981,8 @@ router.post('/api/signup', async function(req, res, next) {
   const fullName = String(req.body.fullName ?? '').trim();
   const email = String(req.body.email ?? '').trim().toLowerCase();
   const password = String(req.body.password ?? '');
+  const requestedRole = String(req.body.role ?? 'user').trim().toLowerCase();
+  const adminKey = String(req.body.adminKey ?? '').trim();
 
   if (!fullName || !email || !password) {
     return res.status(400).json({
@@ -481,24 +997,36 @@ router.post('/api/signup', async function(req, res, next) {
       message: 'Please enter a valid email address'
     });
   }
-  
+
+  const role = requestedRole === 'admin' ? 'admin' : 'user';
+
+  if (role === 'admin') {
+    const secretKey = process.env.ADMIN_SECRET_KEY || '';
+    if (!adminKey || adminKey !== secretKey) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Invalid admin security key'
+      });
+    }
+  }
+
   try {
     const [existing] = await db.execute('SELECT * FROM users WHERE fullName = ? OR email = ?', [fullName, email]);
-    
+
     if (existing.length > 0) {
       const isEmail = existing.some(user => user.email === email);
-      return res.status(400).json({ 
-        status: 'error', 
-        message: isEmail ? 'Email already registered' : 'Name already taken' 
+      return res.status(400).json({
+        status: 'error',
+        message: isEmail ? 'Email already registered' : 'Name already taken'
       });
     }
 
     const [result] = await db.execute(
-      'INSERT INTO users (fullName, email, password) VALUES (?, ?, ?)',
-      [fullName, email, hashPassword(password)]
+      'INSERT INTO users (fullName, email, password, role) VALUES (?, ?, ?, ?)',
+      [fullName, email, hashPassword(password), role]
     );
 
-    const user = { id: result.insertId, email, fullName };
+    const user = { id: result.insertId, email, fullName, role };
 
     res.json({
       status: 'success',
@@ -511,14 +1039,272 @@ router.post('/api/signup', async function(req, res, next) {
   }
 });
 
+/* POST forgot-password. */
+router.post('/api/forgot-password', async function(req, res, next) {
+  const identity = String(req.body.identity ?? '').trim();
+
+  if (!identity) {
+    return res.status(400).json({ status: 'error', message: 'Email or username is required' });
+  }
+
+  try {
+    const [rows] = await db.execute(
+      'SELECT * FROM users WHERE email = ? OR fullName = ? LIMIT 1',
+      [identity, identity]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'No account found with that email or username' });
+    }
+
+    const user = rows[0];
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    await db.execute(
+      'INSERT INTO otps (user_id, code, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE code = ?, expires_at = ?',
+      [user.id, otp, expiresAt, otp, expiresAt]
+    );
+
+    const mailOptions = {
+      from: `"Heritage of Cameroon" <${process.env.EMAIL_USER}>`,
+      to: user.email,
+      subject: 'Password Reset Code',
+      text: `Your password reset code is: ${otp}. It expires in 4 minutes. If you did not request this, ignore this email.`,
+      html: `<h3>Heritage of Cameroon</h3><p>Your password reset code is: <b>${otp}</b></p><p>This code expires in 4 minutes. If you did not request a password reset, please ignore this email.</p>`
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.json({
+      status: 'otp_sent',
+      message: 'Password reset code sent to your email',
+      email: user.email,
+      userId: String(user.id),
+      expiresAt: expiresAt.toISOString()
+    });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to process request' });
+  }
+});
+
+/* POST reset-password. */
+router.post('/api/reset-password', async function(req, res, next) {
+  const token = String(req.body.token ?? '');
+  const newPassword = String(req.body.newPassword ?? '');
+
+  if (!token || !newPassword) {
+    return res.status(400).json({ status: 'error', message: 'Token and new password are required' });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ status: 'error', message: 'Password must be at least 6 characters' });
+  }
+
+  const payload = verifyAuthToken(token);
+
+  if (!payload) {
+    return res.status(401).json({ status: 'error', message: 'Invalid or expired session. Please restart the process.' });
+  }
+
+  try {
+    await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashPassword(newPassword), payload.sub]);
+    res.json({ status: 'success', message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to reset password' });
+  }
+});
+
+/* GET current user profile. */
+router.get('/api/profile', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  try {
+    await ensureUserProfileColumns();
+
+    const [rows] = await db.execute(
+      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Profile not found' });
+    }
+
+    const stats = await getProfileStats(userId);
+
+    res.json({
+      status: 'success',
+      profile: mapUserProfile(rows[0], stats)
+    });
+  } catch (error) {
+    console.error('Profile fetch error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch profile' });
+  }
+});
+
+/* PATCH current user profile. */
+router.patch('/api/profile', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+  const fullName = String(req.body.name ?? req.body.fullName ?? '').trim();
+  const email = String(req.body.email ?? '').trim().toLowerCase();
+  const phone = String(req.body.phone ?? '').trim();
+  const location = String(req.body.location ?? '').trim();
+  const bio = String(req.body.bio ?? '').trim();
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!fullName || !email) {
+    return res.status(400).json({ status: 'error', message: 'Name and email are required' });
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ status: 'error', message: 'Please enter a valid email address' });
+  }
+
+  if (phone.length > 50 || location.length > 120 || bio.length > 600) {
+    return res.status(400).json({ status: 'error', message: 'Profile details are too long' });
+  }
+
+  try {
+    await ensureUserProfileColumns();
+
+    const [existingRows] = await db.execute(
+      'SELECT id, email, fullName FROM users WHERE (email = ? OR fullName = ?) AND id <> ? LIMIT 1',
+      [email, fullName, userId]
+    );
+
+    if (existingRows.length > 0) {
+      const conflict = existingRows[0];
+      return res.status(400).json({
+        status: 'error',
+        message: conflict.email === email ? 'Email already registered' : 'Name already taken'
+      });
+    }
+
+    await db.execute(
+      'UPDATE users SET fullName = ?, email = ?, phone = ?, location = ?, bio = ? WHERE id = ?',
+      [fullName, email, phone || null, location || null, bio || null, userId]
+    );
+
+    const [rows] = await db.execute(
+      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const stats = await getProfileStats(userId);
+
+    res.json({
+      status: 'success',
+      message: 'Profile updated',
+      profile: mapUserProfile(rows[0], stats),
+      ...buildAuthResponse(rows[0])
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update profile' });
+  }
+});
+
+/* POST current user avatar. */
+router.post('/api/profile/avatar', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!req.body.mediaData) {
+    return res.status(400).json({ status: 'error', message: 'Avatar image is required' });
+  }
+
+  try {
+    await ensureUserProfileColumns();
+
+    const media = await saveContributionMedia({
+      mediaData: req.body.mediaData,
+      mediaName: req.body.mediaName || 'avatar',
+      mediaMimeType: req.body.mediaMimeType,
+      mediaType: 'photo'
+    });
+
+    await db.execute('UPDATE users SET avatar_url = ? WHERE id = ?', [media.media_url, userId]);
+
+    const [rows] = await db.execute(
+      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const stats = await getProfileStats(userId);
+
+    res.json({
+      status: 'success',
+      message: 'Avatar updated',
+      profile: mapUserProfile(rows[0], stats),
+      ...buildAuthResponse(rows[0])
+    });
+  } catch (error) {
+    console.error('Avatar update error:', error);
+    res.status(500).json({ status: 'error', message: error.message || 'Failed to update avatar' });
+  }
+});
+
+/* PATCH current user password. */
+router.patch('/api/profile/password', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+  const currentPassword = String(req.body.currentPassword ?? '');
+  const newPassword = String(req.body.newPassword ?? '');
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ status: 'error', message: 'Current and new password are required' });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ status: 'error', message: 'New password must be at least 6 characters' });
+  }
+
+  try {
+    const [rows] = await db.execute('SELECT id, password FROM users WHERE id = ? LIMIT 1', [userId]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Profile not found' });
+    }
+
+    if (!verifyPassword(currentPassword, String(rows[0].password || ''))) {
+      return res.status(401).json({ status: 'error', message: 'Current password is incorrect' });
+    }
+
+    await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashPassword(newPassword), userId]);
+
+    res.json({ status: 'success', message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('Password change error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to change password' });
+  }
+});
+
 /* GET contributions. */
 router.get('/api/contributions', async function(req, res, next) {
   try {
-    const [rows] = await db.execute('SELECT * FROM contributions ORDER BY created_at DESC');
-    res.json(await attachContributionMedia(rows));
+    const [rows] = await db.execute(`
+      SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
+      FROM contributions c
+      LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
+      ORDER BY c.created_at DESC
+    `);
+    res.json(rows);
   } catch (error) {
     console.error('Database error:', error);
-    // If table doesn't exist, return empty array for now to avoid crashing
     if (error.code === 'ER_NO_SUCH_TABLE') {
       return res.json([]);
     }
@@ -531,6 +1317,7 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
   const tribe = String(req.body.tribe ?? '').trim();
   const story = String(req.body.story ?? '').trim();
   const mediaType = String(req.body.mediaType || 'none');
+  const reviewStatus = req.authUser.role === 'admin' ? 'Approved' : 'Pending';
   
   if (!tribe || !story) {
     return res.status(400).json({ status: 'error', message: 'Tribe and story are required' });
@@ -552,24 +1339,204 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
   try {
     const [result] = await db.execute(
       'INSERT INTO contributions (tribe, story, media_type, status, created_at) VALUES (?, ?, ?, ?, NOW())',
-      [tribe, story, media ? mediaType : 'none', 'Pending']
+      [tribe, story, media ? mediaType : 'none', reviewStatus]
     );
 
     if (media) {
-      const mediaStore = await readMediaStore();
-      mediaStore[String(result.insertId)] = media;
-      await writeMediaStore(mediaStore);
+      await db.execute(
+        'INSERT INTO contribution_media (contribution_id, media_url, media_name, media_mime_type) VALUES (?, ?, ?, ?)',
+        [result.insertId, media.media_url, media.media_name, media.media_mime_type]
+      );
     }
 
     res.json({
       status: 'success',
-      message: 'Contribution submitted successfully',
+      message: reviewStatus === 'Approved'
+        ? 'Contribution approved and published'
+        : 'Contribution submitted for admin approval',
       contributionId: result.insertId,
+      reviewStatus,
       media
     });
   } catch (error) {
     console.error('Database error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to submit contribution' });
+  }
+});
+
+/* ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────── */
+
+/* GET pending contributions (admin). */
+router.get('/api/admin/contributions', requireAdmin, async function(req, res, next) {
+  try {
+    const [rows] = await db.execute(`
+      SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
+      FROM contributions c
+      LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
+      WHERE c.status = 'Pending'
+      ORDER BY c.created_at ASC
+    `);
+    res.json({ status: 'success', contributions: rows });
+  } catch (error) {
+    console.error('Admin contributions error:', error);
+    if (error.code === 'ER_NO_SUCH_TABLE') return res.json({ status: 'success', contributions: [] });
+    res.status(500).json({ status: 'error', message: 'Failed to fetch contributions' });
+  }
+});
+
+/* PATCH contribution status (admin). */
+router.patch('/api/admin/contributions/:id', requireAdmin, async function(req, res, next) {
+  const id = Number(req.params.id);
+  const status = String(req.body.status ?? '');
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Invalid contribution id' });
+  }
+
+  if (!['Approved', 'Rejected'].includes(status)) {
+    return res.status(400).json({ status: 'error', message: 'Status must be Approved or Rejected' });
+  }
+
+  try {
+    const [result] = await db.execute(
+      'UPDATE contributions SET status = ? WHERE id = ?',
+      [status, id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: 'error', message: 'Contribution not found' });
+    }
+
+    res.json({ status: 'success', message: `Contribution ${status.toLowerCase()}` });
+  } catch (error) {
+    console.error('Admin contribution update error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update contribution' });
+  }
+});
+
+/* GET pending events (admin). */
+router.get('/api/admin/events', requireAdmin, async function(req, res, next) {
+  try {
+    await ensureEventsModerationColumns();
+
+    const [rows] = await db.execute(
+      `SELECT id, title, category, region, city, venue, description, event_date, end_date,
+              image_url, organizer, price_label, map_url, is_featured, status
+       FROM events
+       WHERE status = 'Pending'
+       ORDER BY created_at ASC`
+    );
+    res.json({
+      status: 'success',
+      events: rows.map((row) => ({
+        ...mapEvent(row),
+        status: row.status
+      }))
+    });
+  } catch (error) {
+    console.error('Admin events error:', error);
+    if (error.code === 'ER_NO_SUCH_TABLE') return res.json({ status: 'success', events: [] });
+    res.status(500).json({ status: 'error', message: 'Failed to fetch events' });
+  }
+});
+
+/* PATCH event status (admin). */
+router.patch('/api/admin/events/:id', requireAdmin, async function(req, res, next) {
+  const id = Number(req.params.id);
+  const status = String(req.body.status ?? '');
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Invalid event id' });
+  }
+
+  if (!['Approved', 'Rejected'].includes(status)) {
+    return res.status(400).json({ status: 'error', message: 'Status must be Approved or Rejected' });
+  }
+
+  try {
+    await ensureEventsModerationColumns();
+
+    const [result] = await db.execute(
+      'UPDATE events SET status = ?, is_active = ? WHERE id = ?',
+      [status, status === 'Approved' ? 1 : 0, id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: 'error', message: 'Event not found' });
+    }
+
+    res.json({ status: 'success', message: `Event ${status.toLowerCase()}` });
+  } catch (error) {
+    console.error('Admin event update error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update event' });
+  }
+});
+
+/* GET explore sections list for admin form dropdown. */
+router.get('/api/admin/explore-sections', requireAdmin, async function(req, res, next) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT section_key, title, layout FROM explore_sections
+       WHERE layout != 'hero' AND is_active = 1
+       ORDER BY sort_order ASC`
+    );
+    res.json({ status: 'success', sections: rows });
+  } catch (error) {
+    console.error('Admin explore sections error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch sections' });
+  }
+});
+
+/* POST new explore item (admin) — also pushes to home trending. */
+router.post('/api/admin/explore-items', requireAdmin, async function(req, res, next) {
+  const sectionKey = String(req.body.sectionKey ?? '').trim();
+  const title = String(req.body.title ?? '').trim();
+  const eyebrow = String(req.body.eyebrow ?? '').trim() || null;
+  const subtitle = String(req.body.subtitle ?? '').trim() || null;
+  const description = String(req.body.description ?? '').trim() || null;
+  const meta = String(req.body.meta ?? '').trim() || null;
+  const imageUrl = String(req.body.imageUrl ?? '').trim() || null;
+  const icon = String(req.body.icon ?? '').trim() || null;
+  const actionLabel = String(req.body.actionLabel ?? '').trim() || null;
+  const actionRoute = String(req.body.actionRoute ?? '').trim() || null;
+
+  if (!sectionKey || !title) {
+    return res.status(400).json({ status: 'error', message: 'Section and title are required' });
+  }
+
+  try {
+    // Insert into explore_items
+    const [exploreResult] = await db.execute(
+      `INSERT INTO explore_items
+         (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
+          action_label, action_route, sort_order, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`,
+      [sectionKey, eyebrow, title, subtitle, description, meta, imageUrl, icon, actionLabel, actionRoute]
+    );
+
+    // Push to home trending section at the front (lowest sort_order)
+    const [[minRow]] = await db.execute(
+      'SELECT MIN(sort_order) AS min_order FROM home_items WHERE section_key = ?',
+      ['trending']
+    );
+    const trendingSortOrder = (minRow.min_order ?? 1) - 1;
+
+    await db.execute(
+      `INSERT INTO home_items
+         (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
+          action_label, action_route, sort_order, is_active)
+       VALUES ('trending', ?, ?, ?, ?, ?, ?, ?, ?, '/tabs/explore', ?, 1)`,
+      [eyebrow, title, subtitle, description, meta, imageUrl, icon, actionLabel, trendingSortOrder]
+    );
+
+    res.json({
+      status: 'success',
+      message: 'Item added to Explore and pushed to Trending',
+      exploreItemId: exploreResult.insertId
+    });
+  } catch (error) {
+    console.error('Admin add explore item error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to add item' });
   }
 });
 

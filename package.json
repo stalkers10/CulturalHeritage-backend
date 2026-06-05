@@ -5,7 +5,11 @@
   "scripts": {
     "start": "node ./bin/www",
     "dev": "node ./bin/www",
-     "seed:home": "node scripts/seed-home-page.js"
+    "seed:home": "node scripts/seed-home-page.js",
+    "seed:explore": "node scripts/seed-explore-page.js",
+    "seed:events": "node scripts/seed-events-page.js",
+    "migrate:media": "node scripts/migrate-media-to-db.js",
+    "migrate:admin": "node scripts/migrate-add-admin-role.js"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
