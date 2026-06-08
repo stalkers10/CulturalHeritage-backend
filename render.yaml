@@ -11,9 +11,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        fromDatabase:
-          name: cultural-heritage-db
-          property: connectionString
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: ADMIN_SECRET_KEY
@@ -33,8 +31,4 @@ services:
       - key: CLOUDINARY_FOLDER
         value: cultural-heritage
 
-databases:
-  - name: cultural-heritage-db
-    plan: free
-    databaseName: cultural_heritage
-    user: cultural_heritage_user
+
