@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install
-    startCommand: npm run setup:db && npm start
+    startCommand: npm start
     healthCheckPath: /api/test
     autoDeployTrigger: commit
     envVars:
