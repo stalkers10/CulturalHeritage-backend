@@ -13,6 +13,14 @@ const PASSWORD_ITERATIONS = 310000;
 const PASSWORD_KEY_LENGTH = 32;
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'heritage-dev-session-secret';
 const uploadDir = path.join(__dirname, '..', 'public', 'uploads');
+const { v2: cloudinary } = require('cloudinary');
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || 'cultural-heritage';
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -173,13 +181,16 @@ async function ensureUserProfileColumns() {
       ];
 
       for (const [columnName, definition] of columns) {
-        const [rows] = await db.execute(`SHOW COLUMNS FROM users LIKE '${columnName}'`);
+        const { rows } = await db.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_name = $1`,
+          [columnName]
+        );
 
         if (rows.length === 0) {
           try {
-            await db.execute(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`);
+            await db.query(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`);
           } catch (error) {
-            if (error.code !== 'ER_DUP_FIELDNAME') {
+            if (error.code !== '42701') {
               throw error;
             }
           }
@@ -199,13 +210,15 @@ let eventsModerationColumnsPromise = null;
 async function ensureEventsModerationColumns() {
   if (!eventsModerationColumnsPromise) {
     eventsModerationColumnsPromise = (async () => {
-      const [statusColumns] = await db.execute("SHOW COLUMNS FROM events LIKE 'status'");
+      const { rows: statusColumns } = await db.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'events' AND column_name = 'status'`
+      );
 
       if (statusColumns.length === 0) {
         try {
-          await db.execute("ALTER TABLE events ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'Approved' AFTER is_active");
+          await db.query("ALTER TABLE events ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'Approved'");
         } catch (error) {
-          if (error.code !== 'ER_DUP_FIELDNAME') {
+          if (error.code !== '42701') {
             throw error;
           }
         }
@@ -226,15 +239,18 @@ async function ensureExploreMediaColumns() {
     exploreMediaColumnsPromise = (async () => {
       const columns = [
         ['media_url', 'VARCHAR(500) NULL'],
-        ['media_type', "VARCHAR(20) NULL"]
+        ['media_type', 'VARCHAR(20) NULL']
       ];
       for (const [columnName, definition] of columns) {
-        const [rows] = await db.execute(`SHOW COLUMNS FROM explore_items LIKE '${columnName}'`);
+        const { rows } = await db.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = 'explore_items' AND column_name = $1`,
+          [columnName]
+        );
         if (rows.length === 0) {
           try {
-            await db.execute(`ALTER TABLE explore_items ADD COLUMN ${columnName} ${definition}`);
+            await db.query(`ALTER TABLE explore_items ADD COLUMN ${columnName} ${definition}`);
           } catch (error) {
-            if (error.code !== 'ER_DUP_FIELDNAME') throw error;
+            if (error.code !== '42701') throw error;
           }
         }
       }
@@ -250,17 +266,19 @@ let savedHomeItemsTablePromise = null;
 
 async function ensureSavedHomeItemsTable() {
   if (!savedHomeItemsTablePromise) {
-    savedHomeItemsTablePromise = db.execute(`
-      CREATE TABLE IF NOT EXISTS user_saved_home_items (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT NOT NULL,
-        home_item_id INT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY unique_user_home_item_save (user_id, home_item_id),
-        INDEX idx_saved_home_items_user (user_id, created_at),
-        INDEX idx_saved_home_items_item (home_item_id)
-      )
-    `).catch((error) => {
+    savedHomeItemsTablePromise = (async () => {
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS user_saved_home_items (
+          id SERIAL PRIMARY KEY,
+          user_id INT NOT NULL,
+          home_item_id INT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE (user_id, home_item_id)
+        )
+      `);
+      await db.query('CREATE INDEX IF NOT EXISTS idx_saved_home_items_user ON user_saved_home_items (user_id, created_at)');
+      await db.query('CREATE INDEX IF NOT EXISTS idx_saved_home_items_item ON user_saved_home_items (home_item_id)');
+    })().catch((error) => {
       savedHomeItemsTablePromise = null;
       throw error;
     });
@@ -298,33 +316,33 @@ async function getProfileStats(userId) {
   };
 
   try {
-    const [contributionRows] = await db.execute(
-      `SELECT COUNT(*) AS contributionCount,
-              SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) AS approvedContributionCount
+    const { rows: contributionRows } = await db.query(
+      `SELECT COUNT(*)::int AS "contributionCount",
+              COALESCE(SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END), 0)::int AS "approvedContributionCount"
        FROM contributions`
     );
 
     stats.contributionCount = contributionRows[0]?.contributionCount || 0;
     stats.approvedContributionCount = contributionRows[0]?.approvedContributionCount || 0;
   } catch (error) {
-    if (error.code !== 'ER_NO_SUCH_TABLE') {
+    if (error.code !== '42P01') {
       throw error;
     }
   }
 
   try {
-    const [reminderRows] = await db.execute(
-      `SELECT COUNT(*) AS reminderCount,
-              SUM(CASE WHEN remind_at > NOW() THEN 1 ELSE 0 END) AS upcomingReminderCount
+    const { rows: reminderRows } = await db.query(
+      `SELECT COUNT(*)::int AS "reminderCount",
+              COALESCE(SUM(CASE WHEN remind_at > NOW() THEN 1 ELSE 0 END), 0)::int AS "upcomingReminderCount"
        FROM event_reminders
-       WHERE user_id = ?`,
+       WHERE user_id = $1`,
       [userId]
     );
 
     stats.reminderCount = reminderRows[0]?.reminderCount || 0;
     stats.upcomingReminderCount = reminderRows[0]?.upcomingReminderCount || 0;
   } catch (error) {
-    if (error.code !== 'ER_NO_SUCH_TABLE') {
+    if (error.code !== '42P01') {
       throw error;
     }
   }
@@ -332,14 +350,14 @@ async function getProfileStats(userId) {
   try {
     await ensureSavedHomeItemsTable();
 
-    const [savedRows] = await db.execute(
-      'SELECT COUNT(*) AS savedItemCount FROM user_saved_home_items WHERE user_id = ?',
+    const { rows: savedRows } = await db.query(
+      'SELECT COUNT(*)::int AS "savedItemCount" FROM user_saved_home_items WHERE user_id = $1',
       [userId]
     );
 
     stats.savedItemCount = savedRows[0]?.savedItemCount || 0;
   } catch (error) {
-    if (error.code !== 'ER_NO_SUCH_TABLE') {
+    if (error.code !== '42P01') {
       throw error;
     }
   }
@@ -363,6 +381,46 @@ function extensionForMimeType(mimeType) {
   if (mimeType === 'video/mp4') return '.mp4';
   if (mimeType && mimeType.startsWith('image/')) return '.jpg';
   return '.bin';
+}
+
+function hasCloudinaryConfig() {
+  return Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+    process.env.CLOUDINARY_API_KEY &&
+    process.env.CLOUDINARY_API_SECRET
+  );
+}
+
+function cloudinaryResourceType(mediaType) {
+  return mediaType === 'photo' ? 'image' : 'video';
+}
+
+async function uploadMediaToCloudinary({ base64Data, mimeType, mediaType }) {
+  const dataUri = `data:${mimeType};base64,${base64Data}`;
+
+  try {
+    const result = await cloudinary.uploader.upload(dataUri, {
+      folder: CLOUDINARY_FOLDER,
+      resource_type: cloudinaryResourceType(mediaType),
+      overwrite: false
+    });
+
+    return result.secure_url;
+  } catch (error) {
+    console.error('Cloudinary upload failed:', error.message);
+    throw new Error('Could not upload media. Please try again.');
+  }
+}
+
+async function saveMediaToLocalUploads({ buffer, mimeType }) {
+  await fs.mkdir(uploadDir, { recursive: true });
+
+  const storedName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${extensionForMimeType(mimeType)}`;
+  const filePath = path.join(uploadDir, storedName);
+
+  await fs.writeFile(filePath, buffer);
+
+  return `/uploads/${storedName}`;
 }
 
 async function saveContributionMedia({ mediaData, mediaName, mediaMimeType, mediaType }) {
@@ -398,15 +456,16 @@ async function saveContributionMedia({ mediaData, mediaName, mediaMimeType, medi
     throw new Error('Media files must be 8 MB or smaller');
   }
 
-  await fs.mkdir(uploadDir, { recursive: true });
+  if (!hasCloudinaryConfig() && process.env.NODE_ENV === 'production') {
+    throw new Error('Cloudinary is not configured on the server');
+  }
 
-  const storedName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${extensionForMimeType(mimeType)}`;
-  const filePath = path.join(uploadDir, storedName);
-
-  await fs.writeFile(filePath, buffer);
+  const mediaUrl = hasCloudinaryConfig()
+    ? await uploadMediaToCloudinary({ base64Data, mimeType, mediaType })
+    : await saveMediaToLocalUploads({ buffer, mimeType });
 
   return {
-    media_url: `/uploads/${storedName}`,
+    media_url: mediaUrl,
     media_name: sanitizeFileName(mediaName),
     media_mime_type: mimeType
   };
@@ -529,16 +588,16 @@ router.get('/api/test', function(req, res, next) {
 /* GET database-backed home page content. */
 router.get('/api/home', async function(req, res, next) {
   try {
-    const [settingRows] = await db.execute(
+    const { rows: settingRows } = await db.query(
       'SELECT setting_key, setting_value FROM home_settings ORDER BY setting_key'
     );
-    const [sectionRows] = await db.execute(
+    const { rows: sectionRows } = await db.query(
       `SELECT section_key, title, subtitle, action_label, action_route, layout, sort_order
        FROM home_sections
        WHERE is_active = 1
        ORDER BY sort_order ASC, id ASC`
     );
-    const [itemRows] = await db.execute(
+    const { rows: itemRows } = await db.query(
       `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
               action_label, action_route, sort_order
        FROM home_items
@@ -577,7 +636,7 @@ router.get('/api/home', async function(req, res, next) {
   } catch (error) {
     console.error('Home page database error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getHomeMissingTablesResponse(res);
     }
 
@@ -596,13 +655,13 @@ router.get('/api/saved-home-items', requireAuth, async function(req, res, next) 
   try {
     await ensureSavedHomeItemsTable();
 
-    const [rows] = await db.execute(
+    const { rows } = await db.query(
       `SELECT hi.id, hi.section_key, hi.eyebrow, hi.title, hi.subtitle, hi.description, hi.meta,
               hi.image_url, hi.icon, hi.action_label, hi.action_route, hi.sort_order,
               saved.created_at AS saved_at
        FROM user_saved_home_items saved
        INNER JOIN home_items hi ON hi.id = saved.home_item_id
-       WHERE saved.user_id = ? AND hi.is_active = 1
+       WHERE saved.user_id = $1 AND hi.is_active = 1
        ORDER BY saved.created_at DESC, saved.id DESC`,
       [userId]
     );
@@ -614,7 +673,7 @@ router.get('/api/saved-home-items', requireAuth, async function(req, res, next) 
   } catch (error) {
     console.error('Saved home items error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getHomeMissingTablesResponse(res);
     }
 
@@ -638,10 +697,10 @@ router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(
   try {
     await ensureSavedHomeItemsTable();
 
-    const [itemRows] = await db.execute(
+    const { rows: itemRows } = await db.query(
       `SELECT id
        FROM home_items
-       WHERE id = ? AND section_key = 'trending' AND is_active = 1
+       WHERE id = $1 AND section_key = 'trending' AND is_active = 1
        LIMIT 1`,
       [itemId]
     );
@@ -650,14 +709,14 @@ router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(
       return res.status(404).json({ status: 'error', message: 'Trending item not found' });
     }
 
-    const [savedRows] = await db.execute(
-      'SELECT id FROM user_saved_home_items WHERE user_id = ? AND home_item_id = ? LIMIT 1',
+    const { rows: savedRows } = await db.query(
+      'SELECT id FROM user_saved_home_items WHERE user_id = $1 AND home_item_id = $2 LIMIT 1',
       [userId, itemId]
     );
 
     if (savedRows.length > 0) {
-      await db.execute(
-        'DELETE FROM user_saved_home_items WHERE user_id = ? AND home_item_id = ?',
+      await db.query(
+        'DELETE FROM user_saved_home_items WHERE user_id = $1 AND home_item_id = $2',
         [userId, itemId]
       );
 
@@ -668,8 +727,8 @@ router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(
       });
     }
 
-    await db.execute(
-      'INSERT IGNORE INTO user_saved_home_items (user_id, home_item_id) VALUES (?, ?)',
+    await db.query(
+      'INSERT INTO user_saved_home_items (user_id, home_item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [userId, itemId]
     );
 
@@ -681,7 +740,7 @@ router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(
   } catch (error) {
     console.error('Saved home item toggle error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getHomeMissingTablesResponse(res);
     }
 
@@ -693,16 +752,16 @@ router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(
 router.get('/api/explore', async function(req, res, next) {
   try {
     await ensureExploreMediaColumns();
-    const [settingRows] = await db.execute(
+    const { rows: settingRows } = await db.query(
       'SELECT setting_key, setting_value FROM explore_settings ORDER BY setting_key'
     );
-    const [sectionRows] = await db.execute(
+    const { rows: sectionRows } = await db.query(
       `SELECT section_key, eyebrow, title, subtitle, action_label, action_route, layout, sort_order
        FROM explore_sections
        WHERE is_active = 1
        ORDER BY sort_order ASC, id ASC`
     );
-    const [itemRows] = await db.execute(
+    const { rows: itemRows } = await db.query(
       `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
               action_label, action_route, sort_order
        FROM explore_items
@@ -742,7 +801,7 @@ router.get('/api/explore', async function(req, res, next) {
   } catch (error) {
     console.error('Explore page database error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getExploreMissingTablesResponse(res);
     }
 
@@ -758,11 +817,11 @@ router.get('/api/explore/:id', async function(req, res, next) {
   }
   try {
     await ensureExploreMediaColumns();
-    const [[row]] = await db.execute(
+    const { rows: [row] } = await db.query(
       `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
               action_label, action_route, sort_order
        FROM explore_items
-       WHERE id = ? AND is_active = 1
+       WHERE id = $1 AND is_active = 1
        LIMIT 1`,
       [id]
     );
@@ -781,7 +840,7 @@ router.get('/api/events', async function(req, res, next) {
   try {
     await ensureEventsModerationColumns();
 
-    const [rows] = await db.execute(
+    const { rows } = await db.query(
       `SELECT id, title, category, region, city, venue, description, event_date, end_date,
               image_url, organizer, price_label, map_url, is_featured
        FROM events
@@ -796,7 +855,7 @@ router.get('/api/events', async function(req, res, next) {
   } catch (error) {
     console.error('Events database error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getEventsMissingTablesResponse(res);
     }
 
@@ -866,11 +925,12 @@ router.post('/api/events', requireAuth, async function(req, res, next) {
   try {
     await ensureEventsModerationColumns();
 
-    const [result] = await db.execute(
+    const result = await db.query(
       `INSERT INTO events
          (title, category, region, city, venue, description, event_date, end_date,
           image_url, organizer, price_label, map_url, is_featured, is_active, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0, $13, $14)
+       RETURNING id`,
       [
         title,
         category,
@@ -889,16 +949,17 @@ router.post('/api/events', requireAuth, async function(req, res, next) {
       ]
     );
 
+    const eventId = result.rows[0].id;
     let event = null;
 
     if (reviewStatus === 'Approved') {
-      const [rows] = await db.execute(
+      const { rows } = await db.query(
         `SELECT id, title, category, region, city, venue, description, event_date, end_date,
                 image_url, organizer, price_label, map_url, is_featured
          FROM events
-         WHERE id = ?
+         WHERE id = $1
          LIMIT 1`,
-        [result.insertId]
+        [eventId]
       );
       event = rows[0] ? mapEvent(rows[0]) : null;
     }
@@ -908,18 +969,18 @@ router.post('/api/events', requireAuth, async function(req, res, next) {
       message: reviewStatus === 'Approved'
         ? 'Event published successfully'
         : 'Event submitted for admin approval',
-      eventId: result.insertId,
+      eventId,
       reviewStatus,
       event
     });
   } catch (error) {
     console.error('Submit event error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getEventsMissingTablesResponse(res);
     }
 
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       return res.status(400).json({ status: 'error', message: 'An event with this title already exists' });
     }
 
@@ -936,12 +997,12 @@ router.get('/api/event-reminders', requireAuth, async function(req, res, next) {
   }
 
   try {
-    const [rows] = await db.execute(
+    const { rows } = await db.query(
       `SELECT er.id, er.event_id, er.remind_at, er.reminder_offset_minutes, er.notification_id,
               e.title AS event_title, e.event_date
        FROM event_reminders er
        INNER JOIN events e ON e.id = er.event_id
-       WHERE er.user_id = ?
+       WHERE er.user_id = $1
        ORDER BY er.remind_at ASC, er.id ASC`,
       [userId]
     );
@@ -953,7 +1014,7 @@ router.get('/api/event-reminders', requireAuth, async function(req, res, next) {
   } catch (error) {
     console.error('Event reminders database error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getEventsMissingTablesResponse(res);
     }
 
@@ -990,8 +1051,8 @@ router.post('/api/event-reminders', requireAuth, async function(req, res, next) 
   }
 
   try {
-    const [eventRows] = await db.execute(
-      'SELECT id, title, event_date FROM events WHERE id = ? AND is_active = 1 LIMIT 1',
+    const { rows: eventRows } = await db.query(
+      'SELECT id, title, event_date FROM events WHERE id = $1 AND is_active = 1 LIMIT 1',
       [eventId]
     );
 
@@ -999,22 +1060,22 @@ router.post('/api/event-reminders', requireAuth, async function(req, res, next) 
       return res.status(404).json({ status: 'error', message: 'Event not found' });
     }
 
-    await db.execute(
+    await db.query(
       `INSERT INTO event_reminders (user_id, event_id, remind_at, reminder_offset_minutes, notification_id)
-       VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         remind_at = VALUES(remind_at),
-         reminder_offset_minutes = VALUES(reminder_offset_minutes),
-         notification_id = VALUES(notification_id)`,
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_id, event_id) DO UPDATE SET
+         remind_at = EXCLUDED.remind_at,
+         reminder_offset_minutes = EXCLUDED.reminder_offset_minutes,
+         notification_id = EXCLUDED.notification_id`,
       [userId, eventId, remindAt, reminderOffsetMinutes, notificationId]
     );
 
-    const [reminderRows] = await db.execute(
+    const { rows: reminderRows } = await db.query(
       `SELECT er.id, er.event_id, er.remind_at, er.reminder_offset_minutes, er.notification_id,
               e.title AS event_title, e.event_date
        FROM event_reminders er
        INNER JOIN events e ON e.id = er.event_id
-       WHERE er.user_id = ? AND er.event_id = ?
+       WHERE er.user_id = $1 AND er.event_id = $2
        LIMIT 1`,
       [userId, eventId]
     );
@@ -1027,7 +1088,7 @@ router.post('/api/event-reminders', requireAuth, async function(req, res, next) 
   } catch (error) {
     console.error('Save event reminder error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getEventsMissingTablesResponse(res);
     }
 
@@ -1049,12 +1110,12 @@ router.delete('/api/event-reminders/:id', requireAuth, async function(req, res, 
   }
 
   try {
-    const [result] = await db.execute(
-      'DELETE FROM event_reminders WHERE id = ? AND user_id = ?',
+    const result = await db.query(
+      'DELETE FROM event_reminders WHERE id = $1 AND user_id = $2',
       [reminderId, userId]
     );
 
-    if (result.affectedRows === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({ status: 'error', message: 'Reminder not found' });
     }
 
@@ -1062,7 +1123,7 @@ router.delete('/api/event-reminders/:id', requireAuth, async function(req, res, 
   } catch (error) {
     console.error('Delete event reminder error:', error);
 
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return getEventsMissingTablesResponse(res);
     }
 
@@ -1083,9 +1144,9 @@ router.post('/api/login', async function(req, res, next) {
   }
 
   try {
-    const [rows] = await db.execute(
-      'SELECT * FROM users WHERE email = ? OR fullName = ? LIMIT 1',
-      [identity, identity]
+    const { rows } = await db.query(
+      'SELECT id, email, fullname, password, role, avatar_url FROM users WHERE email = $1 OR fullname = $1 LIMIT 1',
+      [identity]
     );
 
     if (rows.length === 0) {
@@ -1106,11 +1167,11 @@ router.post('/api/login', async function(req, res, next) {
     }
 
     if (!isHashedPassword(storedPassword)) {
-      await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashPassword(password), user.id]);
+      await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashPassword(password), user.id]);
     }
 
-    const [existingOtpRows] = await db.execute(
-      'SELECT code, expires_at FROM otps WHERE user_id = ? AND expires_at > NOW() LIMIT 1',
+    const { rows: existingOtpRows } = await db.query(
+      'SELECT code, expires_at FROM otps WHERE user_id = $1 AND expires_at > NOW() LIMIT 1',
       [user.id]
     );
 
@@ -1124,9 +1185,9 @@ router.post('/api/login', async function(req, res, next) {
       expiresAt = new Date(Date.now() + OTP_TTL_MS);
       otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-      await db.execute(
-        'INSERT INTO otps (user_id, code, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE code = ?, expires_at = ?',
-        [user.id, otp, expiresAt, otp, expiresAt]
+      await db.query(
+        'INSERT INTO otps (user_id, code, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET code = EXCLUDED.code, expires_at = EXCLUDED.expires_at',
+        [user.id, otp, expiresAt]
       );
     }
 
@@ -1167,17 +1228,18 @@ router.post('/api/verify-otp', async function(req, res, next) {
   }
 
   try {
-    const [rows] = await db.execute(
-      'SELECT * FROM otps WHERE user_id = ? AND code = ? AND expires_at > NOW()',
+    const { rows } = await db.query(
+      'SELECT * FROM otps WHERE user_id = $1 AND code = $2 AND expires_at > NOW()',
       [userId, code]
     );
 
     if (rows.length > 0) {
-      // Clear OTP after success
-      await db.execute('DELETE FROM otps WHERE user_id = ?', [userId]);
-      
-      // Get user details
-      const [userRows] = await db.execute('SELECT id, email, fullName, role, avatar_url FROM users WHERE id = ?', [userId]);
+      await db.query('DELETE FROM otps WHERE user_id = $1', [userId]);
+
+      const { rows: userRows } = await db.query(
+        'SELECT id, email, fullname AS "fullName", role, avatar_url FROM users WHERE id = $1',
+        [userId]
+      );
       const user = userRows[0];
 
       res.json({
@@ -1232,7 +1294,10 @@ router.post('/api/signup', async function(req, res, next) {
   }
 
   try {
-    const [existing] = await db.execute('SELECT * FROM users WHERE fullName = ? OR email = ?', [fullName, email]);
+    const { rows: existing } = await db.query(
+      'SELECT id, email, fullname FROM users WHERE fullname = $1 OR email = $2',
+      [fullName, email]
+    );
 
     if (existing.length > 0) {
       const isEmail = existing.some(user => user.email === email);
@@ -1242,12 +1307,12 @@ router.post('/api/signup', async function(req, res, next) {
       });
     }
 
-    const [result] = await db.execute(
-      'INSERT INTO users (fullName, email, password, role) VALUES (?, ?, ?, ?)',
+    const result = await db.query(
+      'INSERT INTO users (fullname, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id',
       [fullName, email, hashPassword(password), role]
     );
 
-    const user = { id: result.insertId, email, fullName, role };
+    const user = { id: result.rows[0].id, email, fullName, role };
 
     res.json({
       status: 'success',
@@ -1269,9 +1334,9 @@ router.post('/api/forgot-password', async function(req, res, next) {
   }
 
   try {
-    const [rows] = await db.execute(
-      'SELECT * FROM users WHERE email = ? OR fullName = ? LIMIT 1',
-      [identity, identity]
+    const { rows } = await db.query(
+      'SELECT id, email FROM users WHERE email = $1 OR fullname = $1 LIMIT 1',
+      [identity]
     );
 
     if (rows.length === 0) {
@@ -1282,9 +1347,9 @@ router.post('/api/forgot-password', async function(req, res, next) {
     const expiresAt = new Date(Date.now() + OTP_TTL_MS);
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    await db.execute(
-      'INSERT INTO otps (user_id, code, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE code = ?, expires_at = ?',
-      [user.id, otp, expiresAt, otp, expiresAt]
+    await db.query(
+      'INSERT INTO otps (user_id, code, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET code = EXCLUDED.code, expires_at = EXCLUDED.expires_at',
+      [user.id, otp, expiresAt]
     );
 
     const mailOptions = {
@@ -1330,7 +1395,7 @@ router.post('/api/reset-password', async function(req, res, next) {
   }
 
   try {
-    await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashPassword(newPassword), payload.sub]);
+    await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashPassword(newPassword), payload.sub]);
     res.json({ status: 'success', message: 'Password reset successfully' });
   } catch (error) {
     console.error('Reset password error:', error);
@@ -1349,8 +1414,8 @@ router.get('/api/profile', requireAuth, async function(req, res, next) {
   try {
     await ensureUserProfileColumns();
 
-    const [rows] = await db.execute(
-      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+    const { rows } = await db.query(
+      'SELECT id, fullname AS "fullName", email, role, avatar_url, phone, location, bio FROM users WHERE id = $1 LIMIT 1',
       [userId]
     );
 
@@ -1398,8 +1463,8 @@ router.patch('/api/profile', requireAuth, async function(req, res, next) {
   try {
     await ensureUserProfileColumns();
 
-    const [existingRows] = await db.execute(
-      'SELECT id, email, fullName FROM users WHERE (email = ? OR fullName = ?) AND id <> ? LIMIT 1',
+    const { rows: existingRows } = await db.query(
+      'SELECT id, email, fullname FROM users WHERE (email = $1 OR fullname = $2) AND id <> $3 LIMIT 1',
       [email, fullName, userId]
     );
 
@@ -1411,13 +1476,13 @@ router.patch('/api/profile', requireAuth, async function(req, res, next) {
       });
     }
 
-    await db.execute(
-      'UPDATE users SET fullName = ?, email = ?, phone = ?, location = ?, bio = ? WHERE id = ?',
+    await db.query(
+      'UPDATE users SET fullname = $1, email = $2, phone = $3, location = $4, bio = $5 WHERE id = $6',
       [fullName, email, phone || null, location || null, bio || null, userId]
     );
 
-    const [rows] = await db.execute(
-      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+    const { rows } = await db.query(
+      'SELECT id, fullname AS "fullName", email, role, avatar_url, phone, location, bio FROM users WHERE id = $1 LIMIT 1',
       [userId]
     );
     const stats = await getProfileStats(userId);
@@ -1456,10 +1521,10 @@ router.post('/api/profile/avatar', requireAuth, async function(req, res, next) {
       mediaType: 'photo'
     });
 
-    await db.execute('UPDATE users SET avatar_url = ? WHERE id = ?', [media.media_url, userId]);
+    await db.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [media.media_url, userId]);
 
-    const [rows] = await db.execute(
-      'SELECT id, fullName, email, role, avatar_url, phone, location, bio FROM users WHERE id = ? LIMIT 1',
+    const { rows } = await db.query(
+      'SELECT id, fullname AS "fullName", email, role, avatar_url, phone, location, bio FROM users WHERE id = $1 LIMIT 1',
       [userId]
     );
     const stats = await getProfileStats(userId);
@@ -1495,7 +1560,7 @@ router.patch('/api/profile/password', requireAuth, async function(req, res, next
   }
 
   try {
-    const [rows] = await db.execute('SELECT id, password FROM users WHERE id = ? LIMIT 1', [userId]);
+    const { rows } = await db.query('SELECT id, password FROM users WHERE id = $1 LIMIT 1', [userId]);
 
     if (rows.length === 0) {
       return res.status(404).json({ status: 'error', message: 'Profile not found' });
@@ -1505,7 +1570,7 @@ router.patch('/api/profile/password', requireAuth, async function(req, res, next
       return res.status(401).json({ status: 'error', message: 'Current password is incorrect' });
     }
 
-    await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashPassword(newPassword), userId]);
+    await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashPassword(newPassword), userId]);
 
     res.json({ status: 'success', message: 'Password changed successfully' });
   } catch (error) {
@@ -1517,7 +1582,7 @@ router.patch('/api/profile/password', requireAuth, async function(req, res, next
 /* GET contributions. */
 router.get('/api/contributions', async function(req, res, next) {
   try {
-    const [rows] = await db.execute(`
+    const { rows } = await db.query(`
       SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
       FROM contributions c
       LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
@@ -1526,7 +1591,7 @@ router.get('/api/contributions', async function(req, res, next) {
     res.json(rows);
   } catch (error) {
     console.error('Database error:', error);
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return res.json([]);
     }
     res.status(500).json({ status: 'error', message: 'Failed to fetch contributions' });
@@ -1542,7 +1607,7 @@ router.get('/api/contributions/published', async function(req, res, next) {
   const limitClause = limit ? ` LIMIT ${limit}` : '';
 
   try {
-    const [rows] = await db.execute(`
+    const { rows } = await db.query(`
       SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
       FROM contributions c
       LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
@@ -1553,7 +1618,7 @@ router.get('/api/contributions/published', async function(req, res, next) {
     res.json({ status: 'success', contributions: rows });
   } catch (error) {
     console.error('Published contributions error:', error);
-    if (error.code === 'ER_NO_SUCH_TABLE') {
+    if (error.code === '42P01') {
       return res.json({ status: 'success', contributions: [] });
     }
     res.status(500).json({ status: 'error', message: 'Failed to fetch published contributions' });
@@ -1566,7 +1631,7 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
   const story = String(req.body.story ?? '').trim();
   const mediaType = String(req.body.mediaType || 'none');
   const reviewStatus = req.authUser.role === 'admin' ? 'Approved' : 'Pending';
-  
+
   if (!tribe || !story) {
     return res.status(400).json({ status: 'error', message: 'Tribe and story are required' });
   }
@@ -1585,15 +1650,17 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
   }
 
   try {
-    const [result] = await db.execute(
-      'INSERT INTO contributions (tribe, story, media_type, status, created_at) VALUES (?, ?, ?, ?, NOW())',
+    const result = await db.query(
+      'INSERT INTO contributions (tribe, story, media_type, status, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id',
       [tribe, story, media ? mediaType : 'none', reviewStatus]
     );
 
+    const contributionId = result.rows[0].id;
+
     if (media) {
-      await db.execute(
-        'INSERT INTO contribution_media (contribution_id, media_url, media_name, media_mime_type) VALUES (?, ?, ?, ?)',
-        [result.insertId, media.media_url, media.media_name, media.media_mime_type]
+      await db.query(
+        'INSERT INTO contribution_media (contribution_id, media_url, media_name, media_mime_type) VALUES ($1, $2, $3, $4)',
+        [contributionId, media.media_url, media.media_name, media.media_mime_type]
       );
     }
 
@@ -1602,7 +1669,7 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
       message: reviewStatus === 'Approved'
         ? 'Contribution approved and published'
         : 'Contribution submitted for admin approval',
-      contributionId: result.insertId,
+      contributionId,
       reviewStatus,
       media
     });
@@ -1617,7 +1684,7 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
 /* GET pending contributions (admin). */
 router.get('/api/admin/contributions', requireAdmin, async function(req, res, next) {
   try {
-    const [rows] = await db.execute(`
+    const { rows } = await db.query(`
       SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
       FROM contributions c
       LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
@@ -1627,7 +1694,7 @@ router.get('/api/admin/contributions', requireAdmin, async function(req, res, ne
     res.json({ status: 'success', contributions: rows });
   } catch (error) {
     console.error('Admin contributions error:', error);
-    if (error.code === 'ER_NO_SUCH_TABLE') return res.json({ status: 'success', contributions: [] });
+    if (error.code === '42P01') return res.json({ status: 'success', contributions: [] });
     res.status(500).json({ status: 'error', message: 'Failed to fetch contributions' });
   }
 });
@@ -1646,12 +1713,12 @@ router.patch('/api/admin/contributions/:id', requireAdmin, async function(req, r
   }
 
   try {
-    const [result] = await db.execute(
-      'UPDATE contributions SET status = ? WHERE id = ?',
+    const result = await db.query(
+      'UPDATE contributions SET status = $1 WHERE id = $2',
       [status, id]
     );
 
-    if (result.affectedRows === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({ status: 'error', message: 'Contribution not found' });
     }
 
@@ -1667,7 +1734,7 @@ router.get('/api/admin/events', requireAdmin, async function(req, res, next) {
   try {
     await ensureEventsModerationColumns();
 
-    const [rows] = await db.execute(
+    const { rows } = await db.query(
       `SELECT id, title, category, region, city, venue, description, event_date, end_date,
               image_url, organizer, price_label, map_url, is_featured, status
        FROM events
@@ -1683,7 +1750,7 @@ router.get('/api/admin/events', requireAdmin, async function(req, res, next) {
     });
   } catch (error) {
     console.error('Admin events error:', error);
-    if (error.code === 'ER_NO_SUCH_TABLE') return res.json({ status: 'success', events: [] });
+    if (error.code === '42P01') return res.json({ status: 'success', events: [] });
     res.status(500).json({ status: 'error', message: 'Failed to fetch events' });
   }
 });
@@ -1704,12 +1771,12 @@ router.patch('/api/admin/events/:id', requireAdmin, async function(req, res, nex
   try {
     await ensureEventsModerationColumns();
 
-    const [result] = await db.execute(
-      'UPDATE events SET status = ?, is_active = ? WHERE id = ?',
+    const result = await db.query(
+      'UPDATE events SET status = $1, is_active = $2 WHERE id = $3',
       [status, status === 'Approved' ? 1 : 0, id]
     );
 
-    if (result.affectedRows === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({ status: 'error', message: 'Event not found' });
     }
 
@@ -1723,7 +1790,7 @@ router.patch('/api/admin/events/:id', requireAdmin, async function(req, res, nex
 /* GET explore sections list for admin form dropdown. */
 router.get('/api/admin/explore-sections', requireAdmin, async function(req, res, next) {
   try {
-    const [rows] = await db.execute(
+    const { rows } = await db.query(
       `SELECT section_key, title, layout FROM explore_sections
        WHERE layout != 'hero' AND is_active = 1
        ORDER BY sort_order ASC`
@@ -1782,34 +1849,36 @@ router.post('/api/admin/explore-items', requireAdmin, async function(req, res, n
 
   try {
     await ensureExploreMediaColumns();
-    const [exploreResult] = await db.execute(
+    const exploreResult = await db.query(
       `INSERT INTO explore_items
          (section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
           action_label, action_route, sort_order, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 1, 1)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, 1, 1)
+       RETURNING id`,
       [sectionKey, eyebrow, title, subtitle, description, meta, imageUrl, mediaUrl, mediaType, icon]
     );
 
+    const exploreItemId = exploreResult.rows[0].id;
+
     // Push to home trending section at the front (lowest sort_order)
-    const [[minRow]] = await db.execute(
-      'SELECT MIN(sort_order) AS min_order FROM home_items WHERE section_key = ?',
-      ['trending']
+    const { rows: [minRow] } = await db.query(
+      "SELECT MIN(sort_order) AS min_order FROM home_items WHERE section_key = 'trending'"
     );
     const trendingSortOrder = (minRow.min_order ?? 1) - 1;
-    const trendingActionRoute = `/tabs/explore/${exploreResult.insertId}`;
+    const trendingActionRoute = `/tabs/explore/${exploreItemId}`;
 
-    await db.execute(
+    await db.query(
       `INSERT INTO home_items
          (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
           action_label, action_route, sort_order, is_active)
-       VALUES ('trending', ?, ?, ?, ?, ?, ?, ?, 'View', ?, ?, 1)`,
+       VALUES ('trending', $1, $2, $3, $4, $5, $6, $7, 'View', $8, $9, 1)`,
       [eyebrow, title, subtitle, description, meta, imageUrl, icon, trendingActionRoute, trendingSortOrder]
     );
 
     res.json({
       status: 'success',
       message: 'Item added to Explore and pushed to Trending',
-      exploreItemId: exploreResult.insertId
+      exploreItemId
     });
   } catch (error) {
     console.error('Admin add explore item error:', error);

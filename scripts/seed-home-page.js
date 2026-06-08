@@ -116,17 +116,16 @@ const items = [
 ];
 
 async function seedHomePage() {
-  await db.execute(`
+  await db.query(`
     CREATE TABLE IF NOT EXISTS home_settings (
       setting_key VARCHAR(100) PRIMARY KEY,
-      setting_value TEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      setting_value TEXT NOT NULL
     )
   `);
 
-  await db.execute(`
+  await db.query(`
     CREATE TABLE IF NOT EXISTS home_sections (
-      id INT AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       section_key VARCHAR(100) NOT NULL UNIQUE,
       title VARCHAR(255) NOT NULL,
       subtitle VARCHAR(255) NULL,
@@ -134,14 +133,13 @@ async function seedHomePage() {
       action_route VARCHAR(255) NULL,
       layout VARCHAR(50) NOT NULL,
       sort_order INT NOT NULL DEFAULT 0,
-      is_active TINYINT(1) NOT NULL DEFAULT 1,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      is_active SMALLINT NOT NULL DEFAULT 1
     )
   `);
 
-  await db.execute(`
+  await db.query(`
     CREATE TABLE IF NOT EXISTS home_items (
-      id INT AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       section_key VARCHAR(100) NOT NULL,
       eyebrow VARCHAR(100) NULL,
       title VARCHAR(255) NOT NULL,
@@ -153,56 +151,56 @@ async function seedHomePage() {
       action_label VARCHAR(100) NULL,
       action_route VARCHAR(255) NULL,
       sort_order INT NOT NULL DEFAULT 0,
-      is_active TINYINT(1) NOT NULL DEFAULT 1,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY unique_home_item (section_key, title),
-      INDEX idx_home_items_section (section_key, sort_order)
+      is_active SMALLINT NOT NULL DEFAULT 1,
+      UNIQUE (section_key, title)
     )
   `);
 
+  await db.query('CREATE INDEX IF NOT EXISTS idx_home_items_section ON home_items (section_key, sort_order)');
+
   for (const setting of settings) {
-    await db.execute(
+    await db.query(
       `INSERT INTO home_settings (setting_key, setting_value)
-       VALUES (?, ?)
-       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+       VALUES ($1, $2)
+       ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value`,
       setting
     );
   }
 
   for (const section of sections) {
-    await db.execute(
+    await db.query(
       `INSERT INTO home_sections
          (section_key, title, subtitle, action_label, action_route, layout, sort_order, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         title = VALUES(title),
-         subtitle = VALUES(subtitle),
-         action_label = VALUES(action_label),
-         action_route = VALUES(action_route),
-         layout = VALUES(layout),
-         sort_order = VALUES(sort_order),
-         is_active = VALUES(is_active)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (section_key) DO UPDATE SET
+         title = EXCLUDED.title,
+         subtitle = EXCLUDED.subtitle,
+         action_label = EXCLUDED.action_label,
+         action_route = EXCLUDED.action_route,
+         layout = EXCLUDED.layout,
+         sort_order = EXCLUDED.sort_order,
+         is_active = EXCLUDED.is_active`,
       section
     );
   }
 
   for (const item of items) {
-    await db.execute(
+    await db.query(
       `INSERT INTO home_items
          (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
           action_label, action_route, sort_order, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         eyebrow = VALUES(eyebrow),
-         subtitle = VALUES(subtitle),
-         description = VALUES(description),
-         meta = VALUES(meta),
-         image_url = VALUES(image_url),
-         icon = VALUES(icon),
-         action_label = VALUES(action_label),
-         action_route = VALUES(action_route),
-         sort_order = VALUES(sort_order),
-         is_active = VALUES(is_active)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (section_key, title) DO UPDATE SET
+         eyebrow = EXCLUDED.eyebrow,
+         subtitle = EXCLUDED.subtitle,
+         description = EXCLUDED.description,
+         meta = EXCLUDED.meta,
+         image_url = EXCLUDED.image_url,
+         icon = EXCLUDED.icon,
+         action_label = EXCLUDED.action_label,
+         action_route = EXCLUDED.action_route,
+         sort_order = EXCLUDED.sort_order,
+         is_active = EXCLUDED.is_active`,
       [
         item.sectionKey,
         item.eyebrow,

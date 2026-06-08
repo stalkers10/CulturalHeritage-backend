@@ -8,10 +8,12 @@
     "seed:home": "node scripts/seed-home-page.js",
     "seed:explore": "node scripts/seed-explore-page.js",
     "seed:events": "node scripts/seed-events-page.js",
+    "setup:db": "node scripts/setup-db.js",
     "migrate:media": "node scripts/migrate-media-to-db.js",
     "migrate:admin": "node scripts/migrate-add-admin-role.js"
   },
   "dependencies": {
+    "cloudinary": "^2.10.0",
     "cookie-parser": "~1.4.4",
     "cors": "^2.8.6",
     "debug": "~2.6.9",

@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: cultural-heritage-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run setup:db && npm start
+    healthCheckPath: /api/test
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cultural-heritage-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ADMIN_SECRET_KEY
+        sync: false
+      - key: EMAIL_SERVICE
+        value: gmail
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: cultural-heritage
+
+databases:
+  - name: cultural-heritage-db
+    plan: free
+    databaseName: cultural_heritage
+    user: cultural_heritage_user
