@@ -219,6 +219,56 @@ async function ensureEventsModerationColumns() {
   return eventsModerationColumnsPromise;
 }
 
+let exploreMediaColumnsPromise = null;
+
+async function ensureExploreMediaColumns() {
+  if (!exploreMediaColumnsPromise) {
+    exploreMediaColumnsPromise = (async () => {
+      const columns = [
+        ['media_url', 'VARCHAR(500) NULL'],
+        ['media_type', "VARCHAR(20) NULL"]
+      ];
+      for (const [columnName, definition] of columns) {
+        const [rows] = await db.execute(`SHOW COLUMNS FROM explore_items LIKE '${columnName}'`);
+        if (rows.length === 0) {
+          try {
+            await db.execute(`ALTER TABLE explore_items ADD COLUMN ${columnName} ${definition}`);
+          } catch (error) {
+            if (error.code !== 'ER_DUP_FIELDNAME') throw error;
+          }
+        }
+      }
+    })().catch((error) => {
+      exploreMediaColumnsPromise = null;
+      throw error;
+    });
+  }
+  return exploreMediaColumnsPromise;
+}
+
+let savedHomeItemsTablePromise = null;
+
+async function ensureSavedHomeItemsTable() {
+  if (!savedHomeItemsTablePromise) {
+    savedHomeItemsTablePromise = db.execute(`
+      CREATE TABLE IF NOT EXISTS user_saved_home_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        home_item_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_user_home_item_save (user_id, home_item_id),
+        INDEX idx_saved_home_items_user (user_id, created_at),
+        INDEX idx_saved_home_items_item (home_item_id)
+      )
+    `).catch((error) => {
+      savedHomeItemsTablePromise = null;
+      throw error;
+    });
+  }
+
+  return savedHomeItemsTablePromise;
+}
+
 function mapUserProfile(user, stats = {}) {
   return {
     id: String(user.id),
@@ -232,7 +282,8 @@ function mapUserProfile(user, stats = {}) {
       contributionCount: Number(stats.contributionCount || 0),
       approvedContributionCount: Number(stats.approvedContributionCount || 0),
       reminderCount: Number(stats.reminderCount || 0),
-      upcomingReminderCount: Number(stats.upcomingReminderCount || 0)
+      upcomingReminderCount: Number(stats.upcomingReminderCount || 0),
+      savedItemCount: Number(stats.savedItemCount || 0)
     }
   };
 }
@@ -242,7 +293,8 @@ async function getProfileStats(userId) {
     contributionCount: 0,
     approvedContributionCount: 0,
     reminderCount: 0,
-    upcomingReminderCount: 0
+    upcomingReminderCount: 0,
+    savedItemCount: 0
   };
 
   try {
@@ -271,6 +323,21 @@ async function getProfileStats(userId) {
 
     stats.reminderCount = reminderRows[0]?.reminderCount || 0;
     stats.upcomingReminderCount = reminderRows[0]?.upcomingReminderCount || 0;
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  try {
+    await ensureSavedHomeItemsTable();
+
+    const [savedRows] = await db.execute(
+      'SELECT COUNT(*) AS savedItemCount FROM user_saved_home_items WHERE user_id = ?',
+      [userId]
+    );
+
+    stats.savedItemCount = savedRows[0]?.savedItemCount || 0;
   } catch (error) {
     if (error.code !== 'ER_NO_SUCH_TABLE') {
       throw error;
@@ -362,6 +429,13 @@ function mapHomeItem(row) {
   };
 }
 
+function mapSavedHomeItem(row) {
+  return {
+    ...mapHomeItem(row),
+    savedAt: row.saved_at
+  };
+}
+
 function mapExploreItem(row) {
   return {
     id: Number(row.id),
@@ -372,6 +446,8 @@ function mapExploreItem(row) {
     description: row.description,
     meta: row.meta,
     imageUrl: row.image_url,
+    mediaUrl: row.media_url || null,
+    mediaType: row.media_type || null,
     icon: row.icon,
     actionLabel: row.action_label,
     actionRoute: row.action_route,
@@ -509,9 +585,114 @@ router.get('/api/home', async function(req, res, next) {
   }
 });
 
+/* GET saved trending items for the logged-in user. */
+router.get('/api/saved-home-items', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  try {
+    await ensureSavedHomeItemsTable();
+
+    const [rows] = await db.execute(
+      `SELECT hi.id, hi.section_key, hi.eyebrow, hi.title, hi.subtitle, hi.description, hi.meta,
+              hi.image_url, hi.icon, hi.action_label, hi.action_route, hi.sort_order,
+              saved.created_at AS saved_at
+       FROM user_saved_home_items saved
+       INNER JOIN home_items hi ON hi.id = saved.home_item_id
+       WHERE saved.user_id = ? AND hi.is_active = 1
+       ORDER BY saved.created_at DESC, saved.id DESC`,
+      [userId]
+    );
+
+    res.json({
+      status: 'success',
+      items: rows.map(mapSavedHomeItem)
+    });
+  } catch (error) {
+    console.error('Saved home items error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getHomeMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to fetch saved items' });
+  }
+});
+
+/* Toggle a trending item saved/unsaved for the logged-in user. */
+router.post('/api/saved-home-items/:itemId/toggle', requireAuth, async function(req, res, next) {
+  const userId = Number(req.authUser.sub);
+  const itemId = Number(req.params.itemId);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(401).json({ status: 'error', message: 'Invalid user session' });
+  }
+
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return res.status(400).json({ status: 'error', message: 'Invalid item id' });
+  }
+
+  try {
+    await ensureSavedHomeItemsTable();
+
+    const [itemRows] = await db.execute(
+      `SELECT id
+       FROM home_items
+       WHERE id = ? AND section_key = 'trending' AND is_active = 1
+       LIMIT 1`,
+      [itemId]
+    );
+
+    if (itemRows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Trending item not found' });
+    }
+
+    const [savedRows] = await db.execute(
+      'SELECT id FROM user_saved_home_items WHERE user_id = ? AND home_item_id = ? LIMIT 1',
+      [userId, itemId]
+    );
+
+    if (savedRows.length > 0) {
+      await db.execute(
+        'DELETE FROM user_saved_home_items WHERE user_id = ? AND home_item_id = ?',
+        [userId, itemId]
+      );
+
+      return res.json({
+        status: 'success',
+        saved: false,
+        itemId
+      });
+    }
+
+    await db.execute(
+      'INSERT IGNORE INTO user_saved_home_items (user_id, home_item_id) VALUES (?, ?)',
+      [userId, itemId]
+    );
+
+    res.json({
+      status: 'success',
+      saved: true,
+      itemId
+    });
+  } catch (error) {
+    console.error('Saved home item toggle error:', error);
+
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return getHomeMissingTablesResponse(res);
+    }
+
+    res.status(500).json({ status: 'error', message: 'Failed to update saved item' });
+  }
+});
+
 /* GET database-backed explore page content. */
 router.get('/api/explore', async function(req, res, next) {
   try {
+    await ensureExploreMediaColumns();
     const [settingRows] = await db.execute(
       'SELECT setting_key, setting_value FROM explore_settings ORDER BY setting_key'
     );
@@ -522,7 +703,7 @@ router.get('/api/explore', async function(req, res, next) {
        ORDER BY sort_order ASC, id ASC`
     );
     const [itemRows] = await db.execute(
-      `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
+      `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
               action_label, action_route, sort_order
        FROM explore_items
        WHERE is_active = 1
@@ -569,6 +750,32 @@ router.get('/api/explore', async function(req, res, next) {
   }
 });
 
+/* GET single explore item by id. */
+router.get('/api/explore/:id', async function(req, res, next) {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) {
+    return res.status(400).json({ status: 'error', message: 'Invalid item id' });
+  }
+  try {
+    await ensureExploreMediaColumns();
+    const [[row]] = await db.execute(
+      `SELECT id, section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
+              action_label, action_route, sort_order
+       FROM explore_items
+       WHERE id = ? AND is_active = 1
+       LIMIT 1`,
+      [id]
+    );
+    if (!row) {
+      return res.status(404).json({ status: 'error', message: 'Item not found' });
+    }
+    res.json({ status: 'success', item: mapExploreItem(row) });
+  } catch (error) {
+    console.error('Explore item detail error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch item' });
+  }
+});
+
 /* GET database-backed cultural events. */
 router.get('/api/events', async function(req, res, next) {
   try {
@@ -608,7 +815,6 @@ router.post('/api/events', requireAuth, async function(req, res, next) {
   const eventDate = new Date(String(req.body.eventDate || ''));
   const endDateValue = String(req.body.endDate || '').trim();
   const endDate = endDateValue ? new Date(endDateValue) : null;
-  const imageUrl = String(req.body.imageUrl ?? '').trim() || null;
   const organizer = String(req.body.organizer ?? '').trim() || null;
   const priceLabel = String(req.body.priceLabel ?? '').trim() || null;
   const mapUrl = String(req.body.mapUrl ?? '').trim() || null;
@@ -634,12 +840,27 @@ router.post('/api/events', requireAuth, async function(req, res, next) {
     city.length > 100 ||
     venue.length > 255 ||
     description.length > 1200 ||
-    (imageUrl && imageUrl.length > 500) ||
     (organizer && organizer.length > 255) ||
     (priceLabel && priceLabel.length > 100) ||
     (mapUrl && mapUrl.length > 500)
   ) {
     return res.status(400).json({ status: 'error', message: 'Event details are too long' });
+  }
+
+  let imageUrl = null;
+
+  if (req.body.imageData) {
+    try {
+      const saved = await saveContributionMedia({
+        mediaData: req.body.imageData,
+        mediaName: req.body.imageName,
+        mediaMimeType: req.body.imageMimeType,
+        mediaType: 'photo'
+      });
+      imageUrl = saved.media_url;
+    } catch (error) {
+      return res.status(400).json({ status: 'error', message: error.message });
+    }
   }
 
   try {
@@ -1312,6 +1533,33 @@ router.get('/api/contributions', async function(req, res, next) {
   }
 });
 
+/* GET published contributions for public feeds. */
+router.get('/api/contributions/published', async function(req, res, next) {
+  const requestedLimit = Number(req.query.limit);
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, 50)
+    : 0;
+  const limitClause = limit ? ` LIMIT ${limit}` : '';
+
+  try {
+    const [rows] = await db.execute(`
+      SELECT c.*, cm.media_url, cm.media_name, cm.media_mime_type
+      FROM contributions c
+      LEFT JOIN contribution_media cm ON c.id = cm.contribution_id
+      WHERE c.status = 'Approved'
+      ORDER BY c.created_at DESC, c.id DESC
+      ${limitClause}
+    `);
+    res.json({ status: 'success', contributions: rows });
+  } catch (error) {
+    console.error('Published contributions error:', error);
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return res.json({ status: 'success', contributions: [] });
+    }
+    res.status(500).json({ status: 'error', message: 'Failed to fetch published contributions' });
+  }
+});
+
 /* POST contribution. */
 router.post('/api/contributions', requireAuth, async function(req, res, next) {
   const tribe = String(req.body.tribe ?? '').trim();
@@ -1364,7 +1612,7 @@ router.post('/api/contributions', requireAuth, async function(req, res, next) {
   }
 });
 
-/* ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────── */
+/* ADMIN ENDPOINTS */
 
 /* GET pending contributions (admin). */
 router.get('/api/admin/contributions', requireAdmin, async function(req, res, next) {
@@ -1495,23 +1743,51 @@ router.post('/api/admin/explore-items', requireAdmin, async function(req, res, n
   const subtitle = String(req.body.subtitle ?? '').trim() || null;
   const description = String(req.body.description ?? '').trim() || null;
   const meta = String(req.body.meta ?? '').trim() || null;
-  const imageUrl = String(req.body.imageUrl ?? '').trim() || null;
-  const icon = String(req.body.icon ?? '').trim() || null;
-  const actionLabel = String(req.body.actionLabel ?? '').trim() || null;
-  const actionRoute = String(req.body.actionRoute ?? '').trim() || null;
+  const rawMediaType = String(req.body.mediaType || 'none');
 
   if (!sectionKey || !title) {
     return res.status(400).json({ status: 'error', message: 'Section and title are required' });
   }
 
+  let imageUrl = null;
+  let mediaUrl = null;
+  let mediaType = null;
+
+  if (['photo', 'audio', 'video'].includes(rawMediaType) && req.body.mediaData) {
+    let saved;
+    try {
+      saved = await saveContributionMedia({
+        mediaData: req.body.mediaData,
+        mediaName: req.body.mediaName,
+        mediaMimeType: req.body.mediaMimeType,
+        mediaType: rawMediaType
+      });
+    } catch (error) {
+      return res.status(400).json({ status: 'error', message: error.message });
+    }
+
+    if (rawMediaType === 'photo') {
+      imageUrl = saved.media_url;
+    } else {
+      mediaUrl = saved.media_url;
+      mediaType = rawMediaType;
+    }
+  }
+
+  // Auto-derive icon from media type
+  const icon = rawMediaType === 'audio' ? 'audiotrack'
+    : rawMediaType === 'video' ? 'movie'
+    : rawMediaType === 'photo' ? 'image'
+    : null;
+
   try {
-    // Insert into explore_items
+    await ensureExploreMediaColumns();
     const [exploreResult] = await db.execute(
       `INSERT INTO explore_items
-         (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
+         (section_key, eyebrow, title, subtitle, description, meta, image_url, media_url, media_type, icon,
           action_label, action_route, sort_order, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`,
-      [sectionKey, eyebrow, title, subtitle, description, meta, imageUrl, icon, actionLabel, actionRoute]
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 1, 1)`,
+      [sectionKey, eyebrow, title, subtitle, description, meta, imageUrl, mediaUrl, mediaType, icon]
     );
 
     // Push to home trending section at the front (lowest sort_order)
@@ -1520,13 +1796,14 @@ router.post('/api/admin/explore-items', requireAdmin, async function(req, res, n
       ['trending']
     );
     const trendingSortOrder = (minRow.min_order ?? 1) - 1;
+    const trendingActionRoute = `/tabs/explore/${exploreResult.insertId}`;
 
     await db.execute(
       `INSERT INTO home_items
          (section_key, eyebrow, title, subtitle, description, meta, image_url, icon,
           action_label, action_route, sort_order, is_active)
-       VALUES ('trending', ?, ?, ?, ?, ?, ?, ?, ?, '/tabs/explore', ?, 1)`,
-      [eyebrow, title, subtitle, description, meta, imageUrl, icon, actionLabel, trendingSortOrder]
+       VALUES ('trending', ?, ?, ?, ?, ?, ?, ?, 'View', ?, ?, 1)`,
+      [eyebrow, title, subtitle, description, meta, imageUrl, icon, trendingActionRoute, trendingSortOrder]
     );
 
     res.json({
