@@ -16,10 +16,12 @@ services:
         generateValue: true
       - key: ADMIN_SECRET_KEY
         sync: false
-      - key: RESEND_API_KEY
+      - key: BREVO_API_KEY
         sync: false
-      - key: RESEND_FROM
+      - key: BREVO_FROM_EMAIL
         sync: false
+      - key: BREVO_FROM_NAME
+        value: Heritage of Cameroon
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY

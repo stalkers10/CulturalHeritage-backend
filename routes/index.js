@@ -566,23 +566,26 @@ function getEventsMissingTablesResponse(res) {
 }
 
 async function sendEmail({ to, subject, html }) {
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'api-key': process.env.BREVO_API_KEY,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      from: process.env.RESEND_FROM || 'Heritage of Cameroon <onboarding@resend.dev>',
-      to,
+      sender: {
+        name: process.env.BREVO_FROM_NAME || 'Heritage of Cameroon',
+        email: process.env.BREVO_FROM_EMAIL
+      },
+      to: [{ email: to }],
       subject,
-      html
+      htmlContent: html
     })
   });
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(`Resend error ${res.status}: ${body.message || 'unknown'}`);
+    throw new Error(`Brevo error ${res.status}: ${body.message || 'unknown'}`);
   }
 }
 
