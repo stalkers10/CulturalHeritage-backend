@@ -1,7 +1,6 @@
 var express = require('express');
 var router = express.Router();
 const db = require('../config/db');
-const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
@@ -566,16 +565,26 @@ function getEventsMissingTablesResponse(res) {
   });
 }
 
-// Configure Nodemailer 
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+async function sendEmail({ to, subject, html }) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: process.env.RESEND_FROM || 'Heritage of Cameroon <onboarding@resend.dev>',
+      to,
+      subject,
+      html
+    })
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(`Resend error ${res.status}: ${body.message || 'unknown'}`);
+  }
+}
 
 /* GET home page. */
 router.get('/', function(req, res, next) {
@@ -1193,19 +1202,13 @@ router.post('/api/login', async function(req, res, next) {
       );
     }
 
-    // Send OTP via Email
-    const mailOptions = {
-      from: `"Heritage of Cameroon" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: 'Your Login Verification Code',
-      text: `Your OTP is: ${otp}. It expires in a few minutes.`,
-      html: `<h3>Heritage of Cameroon</h3><p>Your verification code is: <b>${otp}</b></p><p>This code expires in a few minutes.</p>`,
-    };
-
     try {
-      await transporter.sendMail(mailOptions);
+      await sendEmail({
+        to: user.email,
+        subject: 'Your Login Verification Code',
+        html: `<h3>Heritage of Cameroon</h3><p>Your verification code is: <b>${otp}</b></p><p>This code expires in a few minutes.</p>`
+      });
     } catch (emailError) {
-      // Email failed — log OTP to console so it can be retrieved from Render logs during testing.
       console.error('Email send failed:', emailError.message);
       console.log(`[OTP for ${user.email}]: ${otp}`);
     }
@@ -1360,15 +1363,11 @@ router.post('/api/forgot-password', async function(req, res, next) {
       [user.id, otp, expiresAt]
     );
 
-    const mailOptions = {
-      from: `"Heritage of Cameroon" <${process.env.EMAIL_USER}>`,
+    await sendEmail({
       to: user.email,
       subject: 'Password Reset Code',
-      text: `Your password reset code is: ${otp}. It expires in 4 minutes. If you did not request this, ignore this email.`,
       html: `<h3>Heritage of Cameroon</h3><p>Your password reset code is: <b>${otp}</b></p><p>This code expires in 4 minutes. If you did not request a password reset, please ignore this email.</p>`
-    };
-
-    await transporter.sendMail(mailOptions);
+    });
 
     res.json({
       status: 'otp_sent',

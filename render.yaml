@@ -16,9 +16,9 @@ services:
         generateValue: true
       - key: ADMIN_SECRET_KEY
         sync: false
-      - key: EMAIL_USER
+      - key: RESEND_API_KEY
         sync: false
-      - key: EMAIL_PASS
+      - key: RESEND_FROM
         sync: false
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
