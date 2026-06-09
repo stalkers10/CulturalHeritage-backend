@@ -1200,7 +1200,13 @@ router.post('/api/login', async function(req, res, next) {
       html: `<h3>Heritage of Cameroon</h3><p>Your verification code is: <b>${otp}</b></p><p>This code expires in a few minutes.</p>`,
     };
 
-    await transporter.sendMail(mailOptions);
+    try {
+      await transporter.sendMail(mailOptions);
+    } catch (emailError) {
+      // Email failed — log OTP to console so it can be retrieved from Render logs during testing.
+      console.error('Email send failed:', emailError.message);
+      console.log(`[OTP for ${user.email}]: ${otp}`);
+    }
 
     res.json({
       status: 'otp_sent',
