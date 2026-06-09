@@ -16,8 +16,6 @@ services:
         generateValue: true
       - key: ADMIN_SECRET_KEY
         sync: false
-      - key: EMAIL_SERVICE
-        value: gmail
       - key: EMAIL_USER
         sync: false
       - key: EMAIL_PASS
