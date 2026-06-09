@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Force IPv4 DNS resolution — Render free tier cannot route outbound IPv6 traffic.
+require('dns').setDefaultResultOrder('ipv4first');
+
 /**
  * Module dependencies.
  */
